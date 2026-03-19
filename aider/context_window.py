@@ -200,6 +200,24 @@ class Forest:
     def cluster_count(self):
         return len(self.roots())
 
+    def remove_cluster(self, root_id):
+        """Remove a cluster by any node id. Returns list of removed node ids."""
+        root = self._find(root_id)
+        members = list(self._children.get(root, {root}))
+
+        for node_id in members:
+            self._parent.pop(node_id, None)
+            self._content.pop(node_id, None)
+            self._embedding.pop(node_id, None)
+
+        self._summary.pop(root, None)
+        self._dirty.discard(root)
+        self._dirty_inputs.pop(root, None)
+        self._children.pop(root, None)
+        self._root_order = [r for r in self._root_order if r not in members]
+
+        return members
+
 
 class ContextWindow:
     """Hot zone + cold forest. Manages graduation and eviction."""
@@ -322,6 +340,10 @@ class ContextWindow:
             parts.append(content)
 
         return parts
+
+    def hot_messages(self):
+        """Return hot zone contents as list of content strings."""
+        return [content for content, _emb in self._hot[self._graduated_index:]]
 
     def resolve_dirty(self):
         """Delegate to forest to summarize all dirty clusters."""

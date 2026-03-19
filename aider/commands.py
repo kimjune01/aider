@@ -436,6 +436,122 @@ class Commands:
         self.coder.done_messages = []
         self.coder.cur_messages = []
 
+    def cmd_topics(self, args):
+        "Show topic clusters in compressed chat history"
+
+        from aider.chat_summary_uf import ChatSummaryUF
+
+        summarizer = self.coder.summarizer
+        if not isinstance(summarizer, ChatSummaryUF):
+            self.io.tool_output(
+                "Topic view requires --chat-history-summarizer union-find."
+            )
+            return
+
+        if self.coder.summarizer_thread is not None:
+            self.io.tool_output(
+                "Summarization is running. Try again in a moment."
+            )
+            return
+
+        cw = summarizer.context_window
+        forest = cw._forest
+        roots = forest.roots()
+
+        if not roots and cw.hot_count == 0:
+            self.io.tool_output("No topics yet (history not compressed).")
+            return
+
+        self.io.tool_output()
+
+        for i, root in enumerate(roots, 1):
+            summary = forest.compact(root)
+            tokens = self.coder.main_model.token_count(summary)
+            preview = summary.split("\n")[0][:80]
+            self.io.tool_output(f"  {i}. {tokens:>5} tokens — \"{preview}\"")
+
+        hot = cw.hot_count
+        if hot > 0:
+            hot_contents = cw.hot_messages()
+            hot_tokens = sum(self.coder.main_model.token_count(c) for c in hot_contents)
+            self.io.tool_output(
+                f"  + {hot_tokens:>5} tokens — {hot} recent messages (not yet compressed)"
+            )
+
+        self.io.tool_output()
+
+    def cmd_drop_topic(self, args):
+        "Drop a topic cluster from compressed chat history"
+
+        from aider.chat_summary_uf import ChatSummaryUF
+
+        summarizer = self.coder.summarizer
+        if not isinstance(summarizer, ChatSummaryUF):
+            self.io.tool_output(
+                "Topic dropping requires --chat-history-summarizer union-find."
+            )
+            return
+
+        if self.coder.summarizer_thread is not None:
+            self.io.tool_output(
+                "Can't drop topics while summarization is running. Try again in a moment."
+            )
+            return
+
+        try:
+            index = int(args.strip())
+        except (ValueError, AttributeError):
+            self.io.tool_error(
+                "Usage: /drop-topic N (where N is the topic number from /topics)"
+            )
+            return
+
+        cw = summarizer.context_window
+        forest = cw._forest
+        roots = forest.roots()
+
+        if index < 1 or index > len(roots):
+            self.io.tool_error(
+                f"Invalid topic number. Use /topics to see available topics (1-{len(roots)})."
+            )
+            return
+
+        root = roots[index - 1]
+        summary = forest.compact(root)
+        tokens = self.coder.main_model.token_count(summary)
+
+        # Remove from forest
+        forest.remove_cluster(root)
+
+        # Re-render and update done_messages (source of truth)
+        rendered = cw.render()
+        hot_count = cw.hot_count
+
+        if rendered:
+            if hot_count > 0 and hot_count < len(rendered):
+                cold_parts = rendered[:-hot_count]
+                summary_text = prompts.summary_prefix + "\n\n".join(cold_parts)
+                hot_messages = list(self.coder.done_messages[-hot_count:])
+                self.coder.done_messages = [
+                    dict(role="user", content=summary_text),
+                    dict(role="assistant", content="Ok."),
+                    *hot_messages,
+                ]
+            elif hot_count == 0:
+                # All hot messages graduated, only cold remains
+                summary_text = prompts.summary_prefix + "\n\n".join(rendered)
+                self.coder.done_messages = [
+                    dict(role="user", content=summary_text),
+                    dict(role="assistant", content="Ok."),
+                ]
+            else:
+                # Only hot messages remain (all cold dropped)
+                self.coder.done_messages = list(self.coder.done_messages[-hot_count:])
+        else:
+            self.coder.done_messages = []
+
+        self.io.tool_output(f"Dropped topic {index} ({tokens:,} tokens freed).")
+
     def cmd_reset(self, args):
         "Drop all files and clear the chat history"
         self._drop_all_files()

@@ -14,6 +14,8 @@ def count(msg):
     """Word-count token counter (matches test_history.py)."""
     if isinstance(msg, list):
         return sum(count(m) for m in msg)
+    if isinstance(msg, str):
+        return len(msg.split())
     return len(msg["content"].split())
 
 
@@ -687,3 +689,294 @@ class TestContextWindow(TestCase):
             rendered = cw.render()
             # Cold part should contain the summary
             self.assertGreater(len(rendered), 0)
+
+    def test_hot_messages_returns_ungraduated(self):
+        cw = ContextWindow(
+            self.embedder, self.mock_summarizer,
+            graduate_at=5, evict_at=10, max_cold_clusters=10,
+        )
+        cw.append("msg one")
+        cw.append("msg two")
+        hot = cw.hot_messages()
+        self.assertEqual(len(hot), 2)
+        self.assertEqual(hot[0], "msg one")
+        self.assertEqual(hot[1], "msg two")
+
+
+# ────────────────────────────────────────────────────────────
+# PR 2: remove_cluster
+# ────────────────────────────────────────────────────────────
+
+
+class TestRemoveCluster(TestCase):
+    def setUp(self):
+        self.mock_summarizer = mock.Mock()
+        self.mock_summarizer.summarize = mock.Mock(return_value="merged summary")
+        self.forest = Forest(summarizer=self.mock_summarizer)
+
+    def test_removes_singleton(self):
+        self.forest.insert("m1", "hello", {"hello": 1.0})
+        removed = self.forest.remove_cluster("m1")
+        self.assertIn("m1", removed)
+        self.assertEqual(self.forest.cluster_count(), 0)
+        self.assertEqual(self.forest.roots(), [])
+
+    def test_removes_merged_cluster(self):
+        self.forest.insert("m1", "hello", {"hello": 1.0})
+        self.forest.insert("m2", "world", {"world": 1.0})
+        self.forest.union("m1", "m2")
+        roots = self.forest.roots()
+        self.assertEqual(len(roots), 1)
+        removed = self.forest.remove_cluster(roots[0])
+        self.assertIn("m1", removed)
+        self.assertIn("m2", removed)
+        self.assertEqual(self.forest.cluster_count(), 0)
+
+    def test_removes_from_all_data_structures(self):
+        self.forest.insert("m1", "hello", {"hello": 1.0})
+        self.forest.insert("m2", "world", {"world": 1.0})
+        self.forest.union("m1", "m2")
+        root = self.forest.roots()[0]
+        self.forest.remove_cluster(root)
+        # All internal structures cleared
+        self.assertEqual(len(self.forest._parent), 0)
+        self.assertEqual(len(self.forest._content), 0)
+        self.assertEqual(len(self.forest._embedding), 0)
+        self.assertEqual(len(self.forest._summary), 0)
+        self.assertEqual(len(self.forest._dirty), 0)
+        self.assertEqual(len(self.forest._children), 0)
+        self.assertEqual(len(self.forest._root_order), 0)
+
+    def test_remove_preserves_other_clusters(self):
+        self.forest.insert("m1", "hello", {"hello": 1.0})
+        self.forest.insert("m2", "world", {"world": 1.0})
+        self.forest.insert("m3", "python", {"python": 1.0})
+        self.forest.union("m1", "m2")
+        # Now: one merged cluster (m1+m2), one singleton (m3)
+        roots = self.forest.roots()
+        self.assertEqual(len(roots), 2)
+        merged_root = [r for r in roots if r != "m3"][0]
+        self.forest.remove_cluster(merged_root)
+        self.assertEqual(self.forest.cluster_count(), 1)
+        self.assertEqual(self.forest.roots(), ["m3"])
+        self.assertEqual(self.forest.compact("m3"), "python")
+
+    def test_remove_by_child_id(self):
+        """Can pass any node in the cluster, not just the root."""
+        self.forest.insert("m1", "hello", {"hello": 1.0})
+        self.forest.insert("m2", "world", {"world": 1.0})
+        self.forest.union("m1", "m2")
+        # Find the non-root node
+        roots = self.forest.roots()
+        root = roots[0]
+        child = "m1" if root == "m2" else "m2"
+        removed = self.forest.remove_cluster(child)
+        self.assertIn("m1", removed)
+        self.assertIn("m2", removed)
+        self.assertEqual(self.forest.cluster_count(), 0)
+
+    def test_removed_content_not_in_render(self):
+        embedder = TFIDFEmbedder()
+        cw = ContextWindow(
+            embedder, self.mock_summarizer,
+            graduate_at=1, evict_at=5, max_cold_clusters=10,
+            merge_threshold=1.0  # never auto-merge, each stays singleton
+        )
+        cw.append("database migration")
+        cw.append("python testing")
+        cw.append("hot message")
+        # First two graduated (graduate_at=1), third is hot
+        roots = cw._forest.roots()
+        self.assertGreater(len(roots), 0)
+        target_root = roots[0]
+        target_content = cw._forest.compact(target_root)
+        cw._forest.remove_cluster(target_root)
+        rendered = cw.render()
+        rendered_text = "\n".join(rendered)
+        self.assertNotIn(target_content, rendered_text)
+
+
+# ────────────────────────────────────────────────────────────
+# PR 2: cmd_topics and cmd_drop_topic
+# ────────────────────────────────────────────────────────────
+
+
+def _make_coder_with_uf(summary_text="This is a summary"):
+    """Build a mock coder with ChatSummaryUF attached."""
+    model = make_mock_model(summary_text=summary_text)
+    summarizer = ChatSummaryUF(models=[model], max_tokens=400)
+    coder = mock.Mock()
+    coder.summarizer = summarizer
+    coder.summarizer_thread = None
+    coder.main_model = model
+    coder.done_messages = []
+    coder.cur_messages = []
+    return coder, summarizer
+
+
+def _feed_topics(summarizer, n_messages=60):
+    """Feed enough messages to create cold clusters."""
+    for i in range(n_messages):
+        role = "USER" if i % 2 == 0 else "ASSISTANT"
+        summarizer.context_window.append(f"# {role}\nMessage {i} about topic {i % 5}")
+    summarizer.context_window.resolve_dirty()
+
+
+class TestCmdTopics(TestCase):
+    def setUp(self):
+        from aider.commands import Commands
+        self.coder, self.summarizer = _make_coder_with_uf()
+        self.io = mock.Mock()
+        self.commands = Commands(self.io, self.coder)
+
+    def test_shows_guidance_for_recursive(self):
+        self.coder.summarizer = mock.Mock(spec=[])  # not ChatSummaryUF
+        self.commands.cmd_topics("")
+        output = self.io.tool_output.call_args_list[-1][0][0]
+        self.assertIn("--chat-history-summarizer", output)
+
+    def test_shows_no_topics_when_empty(self):
+        self.commands.cmd_topics("")
+        output = self.io.tool_output.call_args_list[-1][0][0]
+        self.assertIn("No topics yet", output)
+
+    def test_shows_topics_with_clusters(self):
+        _feed_topics(self.summarizer)
+        self.commands.cmd_topics("")
+        # Should have called tool_output multiple times with topic lines
+        outputs = [call[0][0] for call in self.io.tool_output.call_args_list if call[0]]
+        topic_lines = [o for o in outputs if o.strip().startswith(("1.", "2.", "3."))]
+        self.assertGreater(len(topic_lines), 0)
+
+    def test_shows_hot_zone(self):
+        _feed_topics(self.summarizer)
+        self.commands.cmd_topics("")
+        outputs = [call[0][0] for call in self.io.tool_output.call_args_list if call[0]]
+        hot_lines = [o for o in outputs if "recent messages" in o]
+        self.assertGreater(len(hot_lines), 0)
+
+    def test_refused_during_summarization(self):
+        self.coder.summarizer_thread = mock.Mock()  # non-None = running
+        _feed_topics(self.summarizer)
+        self.commands.cmd_topics("")
+        output = self.io.tool_output.call_args_list[-1][0][0]
+        self.assertIn("Summarization is running", output)
+
+    def test_works_after_thread_completes(self):
+        _feed_topics(self.summarizer)
+        self.coder.summarizer_thread = mock.Mock()
+        self.commands.cmd_topics("")
+        # Refused
+        self.io.reset_mock()
+        self.coder.summarizer_thread = None
+        self.commands.cmd_topics("")
+        # Now should show topics
+        outputs = [call[0][0] for call in self.io.tool_output.call_args_list if call[0]]
+        topic_lines = [o for o in outputs if o.strip().startswith(("1.", "2.", "3."))]
+        self.assertGreater(len(topic_lines), 0)
+
+
+class TestCmdDropTopic(TestCase):
+    def setUp(self):
+        from aider.commands import Commands
+        self.coder, self.summarizer = _make_coder_with_uf()
+        self.io = mock.Mock()
+        self.commands = Commands(self.io, self.coder)
+
+    def test_shows_guidance_for_recursive(self):
+        self.coder.summarizer = mock.Mock(spec=[])
+        self.commands.cmd_drop_topic("1")
+        output = self.io.tool_output.call_args_list[-1][0][0]
+        self.assertIn("--chat-history-summarizer", output)
+
+    def test_invalid_index_shows_error(self):
+        _feed_topics(self.summarizer)
+        self.commands.cmd_drop_topic("999")
+        self.assertTrue(self.io.tool_error.called)
+        output = self.io.tool_error.call_args_list[-1][0][0]
+        self.assertIn("Invalid topic number", output)
+
+    def test_non_integer_shows_usage(self):
+        self.commands.cmd_drop_topic("abc")
+        self.assertTrue(self.io.tool_error.called)
+        output = self.io.tool_error.call_args_list[-1][0][0]
+        self.assertIn("Usage", output)
+
+    def test_empty_args_shows_usage(self):
+        self.commands.cmd_drop_topic("")
+        self.assertTrue(self.io.tool_error.called)
+
+    def test_drop_removes_cluster(self):
+        _feed_topics(self.summarizer)
+        forest = self.summarizer.context_window._forest
+        count_before = forest.cluster_count()
+        self.assertGreater(count_before, 0)
+        self.commands.cmd_drop_topic("1")
+        self.assertEqual(forest.cluster_count(), count_before - 1)
+
+    def test_drop_updates_done_messages(self):
+        _feed_topics(self.summarizer)
+        # Set up done_messages to have something
+        forest = self.summarizer.context_window._forest
+        roots = forest.roots()
+        # Simulate that done_messages has the current rendered state
+        rendered = self.summarizer.context_window.render()
+        hot_count = self.summarizer.context_window.hot_count
+        from aider import prompts
+        if hot_count > 0 and hot_count < len(rendered):
+            cold_parts = rendered[:-hot_count]
+            summary_text = prompts.summary_prefix + "\n\n".join(cold_parts)
+            hot_msgs = [{"role": "user", "content": f"hot {i}"} for i in range(hot_count)]
+            self.coder.done_messages = [
+                {"role": "user", "content": summary_text},
+                {"role": "assistant", "content": "Ok."},
+                *hot_msgs,
+            ]
+
+        old_done = list(self.coder.done_messages)
+        self.commands.cmd_drop_topic("1")
+        # done_messages should have changed
+        self.assertNotEqual(self.coder.done_messages, old_done)
+
+    def test_dropped_content_not_in_done_messages(self):
+        _feed_topics(self.summarizer)
+        forest = self.summarizer.context_window._forest
+        roots = forest.roots()
+        target_summary = forest.compact(roots[0])
+        self.commands.cmd_drop_topic("1")
+        done_text = " ".join(m.get("content", "") for m in self.coder.done_messages)
+        self.assertNotIn(target_summary, done_text)
+
+    def test_refused_during_summarization(self):
+        self.coder.summarizer_thread = mock.Mock()
+        _feed_topics(self.summarizer)
+        forest = self.summarizer.context_window._forest
+        count_before = forest.cluster_count()
+        self.commands.cmd_drop_topic("1")
+        # Forest unchanged
+        self.assertEqual(forest.cluster_count(), count_before)
+        output = self.io.tool_output.call_args_list[-1][0][0]
+        self.assertIn("summarization is running", output.lower())
+
+    def test_drop_all_topics_empties_done_messages(self):
+        _feed_topics(self.summarizer)
+        forest = self.summarizer.context_window._forest
+        count = forest.cluster_count()
+        for i in range(count):
+            self.commands.cmd_drop_topic("1")  # always drop first
+        self.assertEqual(forest.cluster_count(), 0)
+
+    def test_topics_reflects_drop(self):
+        """After dropping a topic, /topics shows fewer entries."""
+        _feed_topics(self.summarizer)
+        forest = self.summarizer.context_window._forest
+        count_before = forest.cluster_count()
+
+        self.commands.cmd_drop_topic("1")
+        self.io.reset_mock()
+
+        self.commands.cmd_topics("")
+        outputs = [call[0][0] for call in self.io.tool_output.call_args_list if call[0]]
+        topic_lines = [o for o in outputs if o.strip() and o.strip()[0].isdigit()]
+        # Should have one fewer topic
+        self.assertEqual(len(topic_lines), count_before - 1)
